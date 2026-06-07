@@ -71,10 +71,20 @@ async function processMessage(phone, text, messageId) {
             const h = new Date(s.endsWith('Z') ? s : s + 'Z').getUTCHours() - 3;
             return `${h}`;
           }).join(', ');
+          const hoursList = group.slots.map(s => {
+            const h = new Date(s.endsWith('Z') ? s : s + 'Z').getUTCHours() - 3;
+            return `${h}:00`;
+          }).join('\n');
           await setState(phone, 'selecting_slot', { ...context, slot_mode: 'selecting_hour', day_slots: group.slots });
-          await sendText(phone, `Perfecto${context.patient_name ? ', ' + context.patient_name : ''}. Para el ${group.label} tenés disponible a las: ${hoursAvail} hs.\n¿A qué hora preferís? Respondé con el número de la hora (ej: 9, 14, 16).`);
+          await sendText(phone, `Perfecto${context.patient_name ? ', ' + context.patient_name : ''}. Para el ${group.label} los horarios disponibles son:\n\n${hoursList}\n\n¿A qué hora preferís?`);
           return;
         }
+      }
+
+      // Resolución por texto natural: "quiero el lunes a las 16", "martes 9hs", etc.
+      const naturalSlot = resolveSlotFromNaturalText(text, context.slots);
+      if (naturalSlot) {
+        return await confirmSlot(phone, naturalSlot, context);
       }
 
       // Filtro por franja horaria (tarde/mañana)
@@ -99,9 +109,15 @@ async function processMessage(phone, text, messageId) {
     }
 
     // 4. Construir prompt y mensajes para Claude
+    // NO pasamos la lista de slots a Claude — la selección siempre la maneja el código.
+    // Solo le indicamos el modo actual para que pueda guiar al paciente.
     const systemPrompt = buildSystemPrompt();
-    const availableSlots = (state === 'selecting_slot' && context.slots) ? context.slots : null;
-    const contextNote = buildContextMessage(state, context, availableSlots);
+    const slotModeHint = context.slot_mode === 'selecting_day'
+      ? 'El paciente está eligiendo un día de la lista que ya se le mostró. Pedile que responda con el número del día.'
+      : context.slot_mode === 'selecting_hour'
+      ? 'El paciente está eligiendo una hora de la lista que ya se le mostró. Pedile que escriba la hora directamente (ej: 9, 14, 16).'
+      : null;
+    const contextNote = buildContextMessage(state, context, null, slotModeHint);
     const fullUserMessage = contextNote ? `${contextNote}\n\nMensaje del paciente: ${text}` : text;
     const messages = buildMessages(fullUserMessage, context);
 
@@ -188,6 +204,10 @@ async function processMessage(phone, text, messageId) {
 
     // 9. Guardar nuevo estado
     const newState = next_state || state;
+    // Limpiar historial al completar o volver a idle para no arrastrar contexto viejo
+    if (newState === 'completed' || (newState === 'idle' && state !== 'idle')) {
+      updatedContext.history = [];
+    }
     await setState(phone, newState, updatedContext);
 
     // 10. Enviar respuesta al paciente
@@ -230,7 +250,7 @@ function formatSlotsByDay(slots) {
     return { label, slots: daySlots, rangeText: `${min}:00 - ${max}:00 hs` };
   });
 
-  const lines = dayGroups.map((g, i) => `  ${i + 1}. ${g.label}: ${g.rangeText}`).join('\n');
+  const lines = dayGroups.map((g, i) => `  ${i + 1}. ${g.label}`).join('\n');
   const msg = `Estos son los días disponibles:\n\n${lines}\n\n¿Qué día preferís? Respondé con el número correspondiente.`;
 
   return { msg, dayGroups };
@@ -296,6 +316,55 @@ function resolveSlotSelection(text, totalSlots) {
   if (!isNaN(num) && num >= 1 && num <= totalSlots) {
     return num - 1;
   }
+  return null;
+}
+
+/**
+ * Intenta resolver un slot desde texto libre cuando el paciente menciona
+ * un día y/o una hora (ej: "quiero el lunes a las 16", "martes 9hs").
+ * Retorna el ISO string del slot encontrado, o null si no puede resolverlo.
+ */
+function resolveSlotFromNaturalText(text, slots) {
+  if (!slots || !slots.length) return null;
+
+  const lower = text.toLowerCase();
+
+  const DAY_NAMES = {
+    'lunes': 1, 'martes': 2, 'miércoles': 3, 'miercoles': 3,
+    'jueves': 4, 'viernes': 5, 'sábado': 6, 'sabado': 6, 'domingo': 0
+  };
+
+  // Detectar día mencionado
+  let targetDay = null;
+  for (const [name, dayNum] of Object.entries(DAY_NAMES)) {
+    if (lower.includes(name)) { targetDay = dayNum; break; }
+  }
+
+  // Detectar hora mencionada: "16hs", "las 16", "a las 9", "16:00", "16h"
+  let targetHour = null;
+  const hourMatch = lower.match(/(?:a\s+las?\s+|las?\s+)?(\d{1,2})(?:\s*(?:hs?|:00))?/);
+  if (hourMatch) {
+    const h = parseInt(hourMatch[1]);
+    if (h >= 0 && h <= 23) targetHour = h;
+  }
+
+  if (targetDay === null && targetHour === null) return null;
+
+  // Filtrar slots que coincidan
+  const candidates = slots.filter(s => {
+    const raw = s.endsWith('Z') ? s : s + 'Z';
+    const dt = new Date(raw);
+    // Convertir a hora Argentina (UTC-3)
+    const argHour = (dt.getUTCHours() - 3 + 24) % 24;
+    const argDay = new Date(dt.getTime() - 3 * 60 * 60 * 1000).getUTCDay();
+
+    const dayOk = targetDay === null || argDay === targetDay;
+    const hourOk = targetHour === null || argHour === targetHour;
+    return dayOk && hourOk;
+  });
+
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1 && targetHour !== null) return candidates[0]; // si hay varias del mismo día+hora, tomar la primera
   return null;
 }
 

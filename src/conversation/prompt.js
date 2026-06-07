@@ -61,7 +61,7 @@ Siempre respondé con JSON puro válido, sin markdown, sin texto extra. Estructu
 
 ACCIONES DISPONIBLES (campo "action"):
 - null: solo responder, sin acción adicional
-- "fetch_slots": consultar Google Calendar. action_params: { "date_preference": "mañana|esta semana|próxima semana|YYYY-MM-DD" }
+- "fetch_slots": consultar Google Calendar. action_params: { "date_preference": "mañana|esta semana|próxima semana|el mes que viene|YYYY-MM-DD|YYYY-MM|nombre del mes" }. Si el paciente pide un mes específico, pasá el nombre exacto del mes (ej: "julio", "agosto", "septiembre 2026"). El sistema buscará la primera semana disponible de ese mes.
 - "create_appointment": crear turno. action_params: { "datetime": "ISO8601", "reason": "motivo de consulta" }
 - "cancel_appointment": cancelar turno. action_params: { "appointment_id": "uuid" }
 - "reschedule_appointment": reprogramar. action_params: { "appointment_id": "uuid" }
@@ -108,7 +108,7 @@ function buildMessages(currentMessage, context) {
  * Construye un mensaje de contexto adicional para Claude
  * con info del paciente y estado actual.
  */
-function buildContextMessage(state, context, availableSlots) {
+function buildContextMessage(state, context, availableSlots, slotModeHint) {
   const parts = [];
 
   if (context.patient_name) {
@@ -119,7 +119,6 @@ function buildContextMessage(state, context, availableSlots) {
   }
   if (context.upcoming_appointments && context.upcoming_appointments.length > 0) {
     const apptList = context.upcoming_appointments.map(a => {
-      // Forzar UTC si el string no trae timezone (Supabase omite la Z)
       const raw = a.datetime.endsWith('Z') ? a.datetime : a.datetime + 'Z';
       const dt = new Date(raw);
       return dt.toLocaleString('es-AR', {
@@ -132,15 +131,11 @@ function buildContextMessage(state, context, availableSlots) {
   } else if (context.upcoming_appointments !== undefined) {
     parts.push('El paciente no tiene turnos próximos agendados.');
   }
-  if (availableSlots && availableSlots.length > 0) {
-    const slotList = availableSlots.map((s, i) =>
-      `  ${i + 1}. ${new Date(s).toLocaleString('es-AR', {
-        weekday: 'long', day: 'numeric', month: 'long',
-        hour: '2-digit', minute: '2-digit',
-        timeZone: 'America/Argentina/Buenos_Aires'
-      })}`
-    ).join('\n');
-    parts.push(`Horarios disponibles:\n${slotList}`);
+
+  // NUNCA pasar lista numerada de slots a Claude — la selección la maneja el código.
+  // Solo informar el modo actual si corresponde.
+  if (slotModeHint) {
+    parts.push(`Instrucción de flujo: ${slotModeHint}`);
   }
 
   parts.push(`Estado actual de la conversación: ${state}`);

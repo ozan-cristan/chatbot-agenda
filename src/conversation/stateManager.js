@@ -50,9 +50,9 @@ function appendHistory(context, role, content) {
   const history = context.history || [];
   history.push({ role, content });
 
-  // Mantener solo los últimos 10 mensajes (5 turnos)
-  if (history.length > 10) {
-    history.splice(0, history.length - 10);
+  // Mantener solo los últimos 6 mensajes (3 turnos)
+  if (history.length > 6) {
+    history.splice(0, history.length - 6);
   }
 
   return { ...context, history };

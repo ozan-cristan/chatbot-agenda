@@ -159,21 +159,62 @@ function parseDatePreference(preference) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   let timeMin, timeMax;
 
+  // Nombres de meses en español (índice 0 = enero)
+  const MONTH_NAMES = {
+    'enero': 0, 'febrero': 1, 'marzo': 2, 'abril': 3,
+    'mayo': 4, 'junio': 5, 'julio': 6, 'agosto': 7,
+    'septiembre': 8, 'setiembre': 8, 'octubre': 9,
+    'noviembre': 10, 'diciembre': 11
+  };
+
   if (!preference || preference === 'mañana') {
     timeMin = new Date(today); timeMin.setDate(timeMin.getDate() + 1);
     timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 1);
   } else if (preference === 'esta semana') {
     timeMin = new Date(today);
     timeMax = new Date(today); timeMax.setDate(timeMax.getDate() + 7);
-  } else if (preference === 'próxima semana') {
+  } else if (preference === 'próxima semana' || preference === 'proxima semana') {
     timeMin = new Date(today); timeMin.setDate(timeMin.getDate() + 7);
+    timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
+  } else if (preference === 'el mes que viene' || preference === 'próximo mes' || preference === 'proximo mes') {
+    timeMin = new Date(today.getFullYear(), today.getMonth() + 1, 1);
     timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
   } else if (/^\d{4}-\d{2}-\d{2}$/.test(preference)) {
     timeMin = new Date(preference);
     timeMax = new Date(preference); timeMax.setDate(timeMax.getDate() + 1);
+  } else if (/^\d{4}-\d{2}$/.test(preference)) {
+    // Formato YYYY-MM → primera semana de ese mes
+    const [year, month] = preference.split('-').map(Number);
+    timeMin = new Date(year, month - 1, 1);
+    timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
   } else {
-    timeMin = new Date(today);
-    timeMax = new Date(today); timeMax.setDate(timeMax.getDate() + 5);
+    // Detectar nombre de mes en español, ej: "julio", "agosto 2026"
+    const lower = preference.toLowerCase().trim();
+    let matchedMonth = null;
+    let matchedYear = today.getFullYear();
+
+    for (const [name, idx] of Object.entries(MONTH_NAMES)) {
+      if (lower.includes(name)) {
+        matchedMonth = idx;
+        const yearMatch = lower.match(/\b(20\d{2})\b/);
+        if (yearMatch) matchedYear = parseInt(yearMatch[1]);
+        break;
+      }
+    }
+
+    if (matchedMonth !== null) {
+      const targetDate = new Date(matchedYear, matchedMonth, 1);
+      // Si el mes ya pasó este año y no se especificó año, usar el próximo año
+      if (targetDate <= today && !lower.match(/\b(20\d{2})\b/)) {
+        targetDate.setFullYear(matchedYear + 1);
+      }
+      timeMin = targetDate;
+      timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
+    } else {
+      // Fallback: próximos 5 días
+      timeMin = new Date(today);
+      timeMax = new Date(today); timeMax.setDate(timeMax.getDate() + 5);
+    }
   }
 
   return { timeMin, timeMax };

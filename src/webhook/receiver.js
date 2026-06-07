@@ -51,13 +51,15 @@ async function handleIncoming(req, res) {
     const phone = message.from;
     const messageId = message.id;
 
-    // Solo procesar mensajes de texto por ahora
     let text = '';
     if (message.type === 'text') {
       text = message.text.body;
     } else if (message.type === 'interactive') {
-      // Respuestas a botones/listas
-      text = message.interactive?.button_reply?.title
+      // Usar el id de la respuesta (contiene el dato real: fecha ISO, "SI", "NO")
+      // y el title como fallback para compatibilidad
+      text = message.interactive?.button_reply?.id
+        || message.interactive?.list_reply?.id
+        || message.interactive?.button_reply?.title
         || message.interactive?.list_reply?.title
         || '';
     } else {

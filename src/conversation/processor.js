@@ -3,7 +3,7 @@ const { buildSystemPrompt, buildMessages, buildContextMessage } = require('./pro
 const { askClaude } = require('../integrations/claude');
 const { getAvailableSlots, createEvent, cancelEvent } = require('../integrations/googleCalendar');
 const { createAppointment, cancelAppointment, getPatientAppointments, upsertPatient, getPatient } = require('../services/appointmentService');
-const { sendText } = require('../webhook/sender');
+const { sendText, sendList, sendButtons } = require('../webhook/sender');
 const logger = require('../utils/logger');
 
 /**
@@ -45,8 +45,14 @@ async function processMessage(phone, text, messageId) {
     // 4. Si el paciente está eligiendo un slot, manejar directamente sin Claude
     if (state === 'selecting_slot' && context.slots && context.slots.length) {
 
-      // Modo selecting_hour: paciente ya eligió día, ahora elige hora
+      // Modo selecting_hour: paciente eligió día, ahora elige hora
       if (context.slot_mode === 'selecting_hour' && context.day_slots) {
+        // Si viene un ISO datetime (respuesta de lista interactiva), usar directo
+        if (/^\d{4}-\d{2}-\d{2}T/.test(text)) {
+          const matched = context.day_slots.find(s => s === text || s.startsWith(text.slice(0, 16)));
+          if (matched) return await confirmSlot(phone, matched, context);
+        }
+        // Fallback: texto libre con hora numérica
         const hourMatch = text.match(/\b(\d{1,2})\b/);
         if (hourMatch) {
           const requestedH = parseInt(hourMatch[1]);
@@ -55,28 +61,32 @@ async function processMessage(phone, text, messageId) {
             return h === requestedH;
           });
           if (matched) return await confirmSlot(phone, matched, context);
-          await sendText(phone, `${context.patient_name ? context.patient_name + ', no' : 'No'} tengo disponibilidad a las ${requestedH}:00 hs ese día. ¿Otra hora?`);
-          return;
         }
-        await sendText(phone, `${context.patient_name ? context.patient_name + ', indicame' : 'Indicame'} la hora que preferís (ej: 9, 10, 14).`);
+        // No se entendió — reenviar lista de horas
+        await sendHoursList(phone, context.day_slots, context.patient_name, context.day_label);
         return;
       }
 
-      // Modo selecting_day: paciente elige el día por número
+      // Modo selecting_day: paciente elige el día
       if (context.slot_mode === 'selecting_day' && context.day_groups) {
-        const dayIndex = resolveSlotSelection(text, context.day_groups.length);
-        if (dayIndex !== null) {
-          const group = context.day_groups[dayIndex];
-          const hoursAvail = group.slots.map(s => {
-            const h = new Date(s.endsWith('Z') ? s : s + 'Z').getUTCHours() - 3;
-            return `${h}`;
-          }).join(', ');
-          const hoursList = group.slots.map(s => {
-            const h = new Date(s.endsWith('Z') ? s : s + 'Z').getUTCHours() - 3;
-            return `${h}:00`;
-          }).join('\n');
-          await setState(phone, 'selecting_slot', { ...context, slot_mode: 'selecting_hour', day_slots: group.slots });
-          await sendText(phone, `Perfecto${context.patient_name ? ', ' + context.patient_name : ''}. Para el ${group.label} los horarios disponibles son:\n\n${hoursList}\n\n¿A qué hora preferís?`);
+        // Si viene un dateKey YYYY-MM-DD (respuesta de lista interactiva)
+        let group = null;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+          group = context.day_groups.find(g => g.dateKey === text);
+        }
+        // Fallback: número
+        if (!group) {
+          const dayIndex = resolveSlotSelection(text, context.day_groups.length);
+          if (dayIndex !== null) group = context.day_groups[dayIndex];
+        }
+        if (group) {
+          await setState(phone, 'selecting_slot', {
+            ...context,
+            slot_mode: 'selecting_hour',
+            day_slots: group.slots,
+            day_label: group.label
+          });
+          await sendHoursList(phone, group.slots, context.patient_name, group.label);
           return;
         }
       }
@@ -101,9 +111,14 @@ async function processMessage(phone, text, messageId) {
           return;
         }
         const filtered = filterResult.slots.filter(s => new Date(s).getUTCMinutes() === 0);
-        const { msg, dayGroups } = formatSlotsByDay(filtered);
+        const { dayGroups } = formatSlotsByDay(filtered);
         await setState(phone, 'selecting_slot', { ...context, slots: filtered, slot_mode: 'selecting_day', day_groups: dayGroups });
-        await sendText(phone, msg);
+        await sendList(
+          phone,
+          `Estos son los días disponibles${context.patient_name ? ', ' + context.patient_name : ''}:`,
+          [{ title: 'Días disponibles', rows: dayGroups.map(g => ({ id: g.dateKey, title: g.label.substring(0, 24) })) }],
+          'Ver días'
+        );
         return;
       }
     }
@@ -210,8 +225,10 @@ async function processMessage(phone, text, messageId) {
     }
     await setState(phone, newState, updatedContext);
 
-    // 10. Enviar respuesta al paciente
-    await sendText(phone, finalResponse);
+    // 10. Enviar respuesta al paciente (null = ya se envió un mensaje interactivo)
+    if (finalResponse) {
+      await sendText(phone, finalResponse);
+    }
 
     logger.info(`Procesado OK — phone: ${phone}, intent: ${intent}, state: ${newState}`);
 
@@ -226,8 +243,9 @@ async function processMessage(phone, text, messageId) {
 }
 
 /**
- * Agrupa slots por día y muestra el rango disponible.
- * Retorna { msg, dayGroups } donde dayGroups es array de { label, slots }.
+ * Agrupa slots por día.
+ * Retorna { dayGroups } donde dayGroups es array de { label, dateKey, slots }.
+ * dateKey es "YYYY-MM-DD" y se usa como id en la lista interactiva.
  */
 function formatSlotsByDay(slots) {
   const byDay = {};
@@ -235,25 +253,47 @@ function formatSlotsByDay(slots) {
   for (const s of slots) {
     const raw = s.endsWith('Z') ? s : s + 'Z';
     const dt = new Date(raw);
-    const dayKey = dt.toLocaleDateString('es-AR', {
+    // Clave de fecha en Argentina
+    const argDate = new Date(dt.getTime() - 3 * 60 * 60 * 1000);
+    const dateKey = argDate.toISOString().slice(0, 10); // YYYY-MM-DD
+    const dayLabel = dt.toLocaleDateString('es-AR', {
       weekday: 'long', day: 'numeric', month: 'long',
       timeZone: 'America/Argentina/Buenos_Aires'
     });
-    if (!byDay[dayKey]) byDay[dayKey] = [];
-    byDay[dayKey].push(s);
+    if (!byDay[dateKey]) byDay[dateKey] = { label: dayLabel, slots: [] };
+    byDay[dateKey].slots.push(s);
   }
 
-  const dayGroups = Object.entries(byDay).map(([label, daySlots]) => {
-    const hours = daySlots.map(s => new Date(s.endsWith('Z') ? s : s + 'Z').getUTCHours() - 3);
-    const min = Math.min(...hours);
-    const max = Math.max(...hours);
-    return { label, slots: daySlots, rangeText: `${min}:00 - ${max}:00 hs` };
+  const dayGroups = Object.entries(byDay)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([dateKey, { label, slots: daySlots }]) => ({
+      label,
+      dateKey,
+      slots: daySlots
+    }));
+
+  return { dayGroups };
+}
+
+/**
+ * Envía la lista interactiva de horas disponibles para un día.
+ */
+async function sendHoursList(phone, daySlots, patientName, dayLabel) {
+  const rows = daySlots.map(s => {
+    const raw = s.endsWith('Z') ? s : s + 'Z';
+    const h = new Date(raw).getUTCHours() - 3;
+    return {
+      id: s,                    // ISO datetime completo como id
+      title: `${h}:00 hs`
+    };
   });
 
-  const lines = dayGroups.map((g, i) => `  ${i + 1}. ${g.label}`).join('\n');
-  const msg = `Estos son los días disponibles:\n\n${lines}\n\n¿Qué día preferís? Respondé con el número correspondiente.`;
-
-  return { msg, dayGroups };
+  await sendList(
+    phone,
+    `Perfecto${patientName ? ', ' + patientName : ''}. Horarios disponibles para el ${dayLabel || 'día seleccionado'}:`,
+    [{ title: 'Horarios', rows }],
+    'Ver horarios'
+  );
 }
 
 /**
@@ -416,9 +456,21 @@ async function executeAction(action, params, phone, context, defaultResponse) {
         return { response: 'No encontré horarios disponibles para esa fecha. ¿Querés que busque en otra semana?' };
       }
 
-      const { msg, dayGroups } = formatSlotsByDay(slots);
+      const { dayGroups } = formatSlotsByDay(slots);
+
+      // Enviar lista interactiva de días (no texto)
+      await sendList(
+        phone,
+        `Estos son los días disponibles${context.patient_name ? ', ' + context.patient_name : ''}:`,
+        [{
+          title: 'Días disponibles',
+          rows: dayGroups.map(g => ({ id: g.dateKey, title: g.label.substring(0, 24) }))
+        }],
+        'Ver días'
+      );
+
       return {
-        response: msg,
+        response: null, // ya enviamos el mensaje interactivo
         slots,
         dayGroups,
         slot_mode: 'selecting_day'

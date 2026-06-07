@@ -17,12 +17,16 @@ async function sendText(phone, text) {
 }
 
 /**
- * Envía una lista de opciones (botones rápidos, máx 3)
+ * Envía botones de respuesta rápida (máx 3).
+ * buttons: array de { id, title } o strings (usa title como id)
  */
 async function sendButtons(phone, bodyText, buttons) {
-  const buttonList = buttons.map((b, i) => ({
+  const buttonList = buttons.map((b) => ({
     type: 'reply',
-    reply: { id: `btn_${i}`, title: b }
+    reply: {
+      id: typeof b === 'string' ? b : b.id,
+      title: typeof b === 'string' ? b : b.title
+    }
   }));
 
   return callApi({
@@ -34,6 +38,35 @@ async function sendButtons(phone, bodyText, buttons) {
       type: 'button',
       body: { text: bodyText },
       action: { buttons: buttonList }
+    }
+  });
+}
+
+/**
+ * Envía una lista interactiva (máx 10 opciones por sección).
+ * sections: [{ title: string, rows: [{ id, title, description? }] }]
+ * buttonText: texto del botón que abre la lista (máx 20 chars)
+ */
+async function sendList(phone, bodyText, sections, buttonText = 'Ver opciones') {
+  return callApi({
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: phone,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: { text: bodyText },
+      action: {
+        button: buttonText.substring(0, 20),
+        sections: sections.map(s => ({
+          title: s.title.substring(0, 24),
+          rows: s.rows.map(r => ({
+            id: String(r.id).substring(0, 200),
+            title: String(r.title).substring(0, 24),
+            ...(r.description ? { description: String(r.description).substring(0, 72) } : {})
+          }))
+        }))
+      }
     }
   });
 }
@@ -86,4 +119,4 @@ async function callApi(payload) {
   }
 }
 
-module.exports = { sendText, sendButtons, sendReminderTemplate };
+module.exports = { sendText, sendButtons, sendList, sendReminderTemplate };

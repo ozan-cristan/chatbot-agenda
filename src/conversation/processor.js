@@ -51,6 +51,7 @@ async function processMessage(phone, text, messageId) {
         if (/^\d{4}-\d{2}-\d{2}T/.test(text)) {
           const matched = context.day_slots.find(s => s === text || s.startsWith(text.slice(0, 16)));
           if (matched) return await confirmSlot(phone, matched, context);
+          logger.warn('ISO datetime recibido pero no matchea ningún slot', { text, day_slots: context.day_slots });
         }
         // Fallback: texto libre con hora numérica
         const hourMatch = text.match(/\b(\d{1,2})\b/);
@@ -213,17 +214,22 @@ async function processMessage(phone, text, messageId) {
       updatedContext.reason = text.trim();
     }
 
-    // 8. Actualizar historial
+    // 8. Actualizar historial (no guardar si la respuesta fue null = mensaje interactivo ya enviado)
     updatedContext = appendHistory(updatedContext, 'user', text);
-    updatedContext = appendHistory(updatedContext, 'assistant', finalResponse);
+    if (finalResponse) {
+      updatedContext = appendHistory(updatedContext, 'assistant', finalResponse);
+    }
 
     // 9. Guardar nuevo estado
+    // Si finalResponse es null, la acción ya guardó su propio estado (lista interactiva enviada)
+    // No pisarlo con el next_state de Claude
     const newState = next_state || state;
-    // Limpiar historial al completar o volver a idle para no arrastrar contexto viejo
-    if (newState === 'completed' || (newState === 'idle' && state !== 'idle')) {
-      updatedContext.history = [];
+    if (finalResponse !== null) {
+      if (newState === 'completed' || (newState === 'idle' && state !== 'idle')) {
+        updatedContext.history = [];
+      }
+      await setState(phone, newState, updatedContext);
     }
-    await setState(phone, newState, updatedContext);
 
     // 10. Enviar respuesta al paciente (null = ya se envió un mensaje interactivo)
     if (finalResponse) {
@@ -279,19 +285,29 @@ function formatSlotsByDay(slots) {
  * Envía la lista interactiva de horas disponibles para un día.
  */
 async function sendHoursList(phone, daySlots, patientName, dayLabel) {
-  const rows = daySlots.map(s => {
+  // WhatsApp permite máximo 10 filas en total por lista
+  const MAX_ROWS = 10;
+  const slotsToShow = daySlots.slice(0, MAX_ROWS);
+
+  const morningRows = [];
+  const afternoonRows = [];
+
+  for (const s of slotsToShow) {
     const raw = s.endsWith('Z') ? s : s + 'Z';
     const h = new Date(raw).getUTCHours() - 3;
-    return {
-      id: s,                    // ISO datetime completo como id
-      title: `${h}:00 hs`
-    };
-  });
+    const row = { id: s, title: `${h}:00 hs` };
+    if (h < 13) morningRows.push(row);
+    else afternoonRows.push(row);
+  }
+
+  const sections = [];
+  if (morningRows.length) sections.push({ title: 'Mañana', rows: morningRows });
+  if (afternoonRows.length) sections.push({ title: 'Tarde', rows: afternoonRows });
 
   await sendList(
     phone,
     `Perfecto${patientName ? ', ' + patientName : ''}. Horarios disponibles para el ${dayLabel || 'día seleccionado'}:`,
-    [{ title: 'Horarios', rows }],
+    sections,
     'Ver horarios'
   );
 }
@@ -508,6 +524,17 @@ async function executeAction(action, params, phone, context, defaultResponse) {
       return { response: '✅ Tu turno fue cancelado. ¿Querés agendar otro?' };
     }
 
+    case 'reschedule_appointment': {
+      // Mostrar lista interactiva de turnos en lugar de texto
+      const appointments = await getPatientAppointments(phone);
+      if (!appointments.length) {
+        return { response: `No encontré turnos activos${context.patient_name ? ', ' + context.patient_name : ''}. ¿Querés agendar uno nuevo?` };
+      }
+      await setState(phone, 'selecting_reschedule_target', { ...context });
+      await sendAppointmentListForReschedule(phone, appointments, context.patient_name);
+      return { response: null }; // ya enviamos la lista interactiva
+    }
+
     case 'notify_doctor': {
       logger.warn(`Escalado a humano — phone: ${phone}, reason: ${params.reason}`);
       return { response: 'Entendido. Voy a avisar al consultorio para que te contacten directamente. ¡Gracias por tu paciencia!' };
@@ -523,10 +550,14 @@ const originalProcessMessage = processMessage;
 
 // Interceptar awaiting_confirmation antes de llegar a Claude
 async function handleConfirmation(phone, text, context) {
-  const answer = text.trim().toUpperCase();
-  const confirmationType = context.confirmation_type || 'create'; // 'create' | 'cancel'
+  const lower = text.trim().toLowerCase();
+  const confirmationType = context.confirmation_type || 'create';
 
-  if (answer === 'SI' || answer === 'SÍ' || answer === 'S') {
+  // Detección flexible de SI/NO
+  const isYes = /^(si|sí|s|yes|dale|ok|confirm|correcto|va|bueno)$/i.test(lower) || lower.startsWith('si ') || lower.startsWith('sí ');
+  const isNo  = /^(no|n|nop|nope|cancel)$/i.test(lower) || lower.startsWith('no ') || lower.includes('otro') || lower.includes('cambiar') || lower.includes('diferente');
+
+  if (isYes) {
 
     if (confirmationType === 'cancel') {
       // Cancelar todos los turnos del paciente
@@ -552,12 +583,36 @@ async function handleConfirmation(phone, text, context) {
       // Crear el turno
       const datetime = context.selected_datetime;
       if (!datetime) {
-        await setState(phone, 'idle', { patient_name: context.patient_name });
-        await sendText(phone, 'Perdoná, perdí el horario seleccionado. ¿Querés que busquemos uno de nuevo?');
+        // Recuperar: volver al paso anterior en lugar de resetear
+        if (context.day_slots && context.day_slots.length) {
+          await setState(phone, 'selecting_slot', { ...context, slot_mode: 'selecting_hour' });
+          await sendHoursList(phone, context.day_slots, context.patient_name, context.day_label);
+        } else if (context.day_groups && context.day_groups.length) {
+          await setState(phone, 'selecting_slot', { ...context, slot_mode: 'selecting_day' });
+          await sendList(
+            phone,
+            `Disculpá${context.patient_name ? ', ' + context.patient_name : ''}, hubo un problema. ¿Qué día preferís?`,
+            [{ title: 'Días disponibles', rows: context.day_groups.map(g => ({ id: g.dateKey, title: g.label.substring(0, 24) })) }],
+            'Ver días'
+          );
+        } else {
+          await setState(phone, 'idle', { patient_name: context.patient_name });
+          await sendText(phone, `Disculpá${context.patient_name ? ', ' + context.patient_name : ''}, hubo un problema. Escribí "turno" para empezar de nuevo.`);
+        }
         return;
       }
       const reason = 'Consulta médica';
       try {
+        // Si es una reprogramación, cancelar el turno viejo primero
+        if (context.reschedule_appointment_id) {
+          try {
+            await cancelEvent(context.reschedule_event_id);
+            await cancelAppointment(context.reschedule_appointment_id);
+          } catch (cancelErr) {
+            logger.warn('Error cancelando turno viejo en reprogramación', { error: cancelErr.message });
+          }
+        }
+
         const eventId = await createEvent(datetime, context.patient_name || phone, reason);
         await createAppointment(phone, eventId, datetime, reason);
         const raw = datetime.endsWith('Z') ? datetime : datetime + 'Z';
@@ -567,32 +622,35 @@ async function handleConfirmation(phone, text, context) {
           hour: '2-digit', minute: '2-digit',
           timeZone: 'America/Argentina/Buenos_Aires'
         });
+        const action = context.reschedule_appointment_id ? 'reprogramado' : 'confirmado';
         await setState(phone, 'completed', { patient_name: context.patient_name });
-        await sendText(phone, `✅ ¡Turno confirmado, ${context.patient_name || ''}!\n\n📅 ${formatted}\n📍 ${process.env.CLINIC_NAME}\n\nTe vamos a recordar 24hs antes. ¡Hasta entonces!`);
+        await sendText(phone, `✅ ¡Turno ${action}, ${context.patient_name || ''}!\n\n📅 ${formatted}\n📍 ${process.env.CLINIC_NAME}\n\nTe vamos a recordar 24hs antes. ¡Hasta entonces!`);
       } catch (err) {
         logger.error('Error creando turno en confirmación', { error: err.message });
         await sendText(phone, 'Tuve un problema al crear el turno. Por favor intentá de nuevo.');
       }
     }
 
-  } else if (answer === 'NO' || answer === 'N') {
+  } else if (isNo) {
     if (confirmationType === 'cancel') {
       await setState(phone, 'idle', { patient_name: context.patient_name });
-      await sendText(phone, 'Perfecto, no cancelamos nada. ¿En qué más te puedo ayudar?');
-    } else if (context.slots && context.slots.length) {
-      const slotText = context.slots.map((s, i) => {
-        const dt = new Date(s);
-        return `${i + 1}. ${dt.toLocaleString('es-AR', {
-          weekday: 'long', day: 'numeric', month: 'long',
-          hour: '2-digit', minute: '2-digit',
-          timeZone: 'America/Argentina/Buenos_Aires'
-        })}`;
-      }).join('\n');
-      await setState(phone, 'selecting_slot', context);
-      await sendText(phone, `Sin problema. ¿Cuál preferís?\n\n${slotText}`);
+      await sendText(phone, `Perfecto${context.patient_name ? ', ' + context.patient_name : ''}, no cancelamos nada. ¿En qué más te puedo ayudar?`);
+    } else if (context.day_slots && context.day_slots.length) {
+      // Volver a mostrar horas del mismo día
+      await setState(phone, 'selecting_slot', { ...context, slot_mode: 'selecting_hour' });
+      await sendHoursList(phone, context.day_slots, context.patient_name, context.day_label);
+    } else if (context.day_groups && context.day_groups.length) {
+      // Volver a mostrar días
+      await setState(phone, 'selecting_slot', { ...context, slot_mode: 'selecting_day' });
+      await sendList(
+        phone,
+        `Sin problema${context.patient_name ? ', ' + context.patient_name : ''}. ¿Qué día preferís?`,
+        [{ title: 'Días disponibles', rows: context.day_groups.map(g => ({ id: g.dateKey, title: g.label.substring(0, 24) })) }],
+        'Ver días'
+      );
     } else {
       await setState(phone, 'idle', { patient_name: context.patient_name });
-      await sendText(phone, '¿En qué más te puedo ayudar?');
+      await sendText(phone, `Sin problema${context.patient_name ? ', ' + context.patient_name : ''}. ¿En qué más te puedo ayudar?`);
     }
   } else {
     const msg = confirmationType === 'cancel'
@@ -602,7 +660,76 @@ async function handleConfirmation(phone, text, context) {
   }
 }
 
-// Sobreescribir processMessage para interceptar awaiting_confirmation
+/**
+ * Muestra los turnos del paciente como lista interactiva para reprogramar.
+ */
+async function sendAppointmentListForReschedule(phone, appointments, patientName) {
+  const rows = appointments.map(a => {
+    const raw = a.datetime.endsWith('Z') ? a.datetime : a.datetime + 'Z';
+    const dt = new Date(raw);
+    // Formato corto para caber en 24 chars: "Lun 09/06 - 14:00 hs"
+    const argDt = new Date(dt.getTime() - 3 * 60 * 60 * 1000);
+    const days = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+    const day = days[argDt.getUTCDay()];
+    const d = String(argDt.getUTCDate()).padStart(2, '0');
+    const m = String(argDt.getUTCMonth() + 1).padStart(2, '0');
+    const h = String(argDt.getUTCHours()).padStart(2, '0');
+    const min = String(argDt.getUTCMinutes()).padStart(2, '0');
+    const label = `${day} ${d}/${m} - ${h}:${min} hs`; // max ~20 chars
+    return { id: a.id, title: label };
+  });
+
+  await sendList(
+    phone,
+    `${patientName ? patientName + ', ' : ''}¿Cuál turno querés reprogramar?`,
+    [{ title: 'Tus turnos', rows: rows.slice(0, 10) }],
+    'Ver turnos'
+  );
+}
+
+/**
+ * Maneja la selección del turno a reprogramar y muestra días disponibles.
+ */
+async function handleRescheduleTarget(phone, text, context) {
+  // El ID del turno viene como UUID desde la lista interactiva
+  const appointments = await getPatientAppointments(phone);
+  const selected = appointments.find(a => a.id === text);
+
+  if (!selected) {
+    // No reconoció la selección — reenviar lista
+    await sendAppointmentListForReschedule(phone, appointments, context.patient_name);
+    return;
+  }
+
+  // Guardar el turno a cancelar y buscar nueva disponibilidad
+  const allSlots = await getAvailableSlots('esta semana');
+  const slots = allSlots.filter(s => new Date(s).getUTCMinutes() === 0);
+
+  if (!slots.length) {
+    await setState(phone, 'idle', { patient_name: context.patient_name });
+    await sendText(phone, `Lo siento${context.patient_name ? ', ' + context.patient_name : ''}, no encontré horarios disponibles esta semana. ¿Querés que busque la próxima?`);
+    return;
+  }
+
+  const { dayGroups } = formatSlotsByDay(slots);
+  await setState(phone, 'selecting_slot', {
+    ...context,
+    slots,
+    day_groups: dayGroups,
+    slot_mode: 'selecting_day',
+    reschedule_appointment_id: selected.id,
+    reschedule_event_id: selected.google_event_id
+  });
+
+  await sendList(
+    phone,
+    `Perfecto${context.patient_name ? ', ' + context.patient_name : ''}. ¿Qué día preferís para el nuevo turno?`,
+    [{ title: 'Días disponibles', rows: dayGroups.map(g => ({ id: g.dateKey, title: g.label.substring(0, 24) })) }],
+    'Ver días'
+  );
+}
+
+// Sobreescribir processMessage para interceptar awaiting_confirmation y reschedule
 module.exports = {
   processMessage: async function(phone, text, messageId) {
     const { state, context } = await getState(phone);
@@ -615,6 +742,11 @@ module.exports = {
 
     if (state === 'awaiting_confirmation') {
       return await handleConfirmation(phone, text, context);
+    }
+
+    // Interceptar selección de turno a reprogramar
+    if (state === 'selecting_reschedule_target') {
+      return await handleRescheduleTarget(phone, text, context);
     }
 
     return await processMessage(phone, text, messageId);

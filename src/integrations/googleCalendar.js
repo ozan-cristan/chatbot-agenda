@@ -156,7 +156,10 @@ async function cancelEvent(eventId) {
 
 function parseDatePreference(preference) {
   const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  // Calcular "hoy" en timezone Argentina (UTC-3) para no incluir fechas pasadas
+  const nowAR = new Date(now.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+  const today = new Date(nowAR.getFullYear(), nowAR.getMonth(), nowAR.getDate());
+
   let timeMin, timeMax;
 
   // Nombres de meses en español (índice 0 = enero)
@@ -167,29 +170,30 @@ function parseDatePreference(preference) {
     'noviembre': 10, 'diciembre': 11
   };
 
-  if (!preference || preference === 'mañana') {
+  const lower = (preference || '').toLowerCase().trim();
+
+  if (!preference || lower === 'mañana') {
     timeMin = new Date(today); timeMin.setDate(timeMin.getDate() + 1);
     timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 1);
-  } else if (preference === 'esta semana') {
+  } else if (lower === 'esta semana') {
     timeMin = new Date(today);
     timeMax = new Date(today); timeMax.setDate(timeMax.getDate() + 7);
-  } else if (preference === 'próxima semana' || preference === 'proxima semana') {
+  } else if (lower === 'próxima semana' || lower === 'proxima semana') {
     timeMin = new Date(today); timeMin.setDate(timeMin.getDate() + 7);
     timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
-  } else if (preference === 'el mes que viene' || preference === 'próximo mes' || preference === 'proximo mes') {
+  } else if (lower === 'el mes que viene' || lower === 'próximo mes' || lower === 'proximo mes') {
     timeMin = new Date(today.getFullYear(), today.getMonth() + 1, 1);
     timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
   } else if (/^\d{4}-\d{2}-\d{2}$/.test(preference)) {
-    timeMin = new Date(preference);
-    timeMax = new Date(preference); timeMax.setDate(timeMax.getDate() + 1);
+    timeMin = new Date(preference + 'T00:00:00');
+    timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 1);
   } else if (/^\d{4}-\d{2}$/.test(preference)) {
-    // Formato YYYY-MM → primera semana de ese mes
+    // Formato YYYY-MM → primeras dos semanas de ese mes
     const [year, month] = preference.split('-').map(Number);
     timeMin = new Date(year, month - 1, 1);
-    timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
+    timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 14);
   } else {
-    // Detectar nombre de mes en español, ej: "julio", "agosto 2026"
-    const lower = preference.toLowerCase().trim();
+    // Detectar nombre de mes con expresiones de período
     let matchedMonth = null;
     let matchedYear = today.getFullYear();
 
@@ -203,18 +207,59 @@ function parseDatePreference(preference) {
     }
 
     if (matchedMonth !== null) {
-      const targetDate = new Date(matchedYear, matchedMonth, 1);
-      // Si el mes ya pasó este año y no se especificó año, usar el próximo año
-      if (targetDate <= today && !lower.match(/\b(20\d{2})\b/)) {
-        targetDate.setFullYear(matchedYear + 1);
+      const hasExplicitYear = /\b(20\d{2})\b/.test(lower);
+      const firstDay = new Date(matchedYear, matchedMonth, 1);
+      const lastDay = new Date(matchedYear, matchedMonth + 1, 0); // último día del mes
+
+      // Si el mes ya terminó completamente y no hay año explícito → próximo año
+      if (lastDay < today && !hasExplicitYear) {
+        matchedYear++;
+        firstDay.setFullYear(matchedYear);
+        lastDay.setFullYear(matchedYear);
       }
-      timeMin = targetDate;
-      timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 7);
+
+      // Detectar expresiones de período dentro del mes
+      const isLastWeek = lower.includes('última semana') || lower.includes('ultima semana') ||
+                         lower.includes('últimos días') || lower.includes('ultimos dias');
+      const isFirstWeek = lower.includes('primera semana') || lower.includes('principios') ||
+                          lower.includes('comienzo') || lower.includes('inicio del mes');
+      const isMidMonth = lower.includes('mediados') || lower.includes('mitad del mes');
+      const isEndOfMonth = lower.includes('fines de') || lower.includes('fin de mes') ||
+                           lower.includes('a fin de') || lower.includes('final del mes');
+
+      if (isLastWeek) {
+        // Última semana del mes: últimos 7 días
+        timeMin = new Date(lastDay); timeMin.setDate(timeMin.getDate() - 6);
+        timeMax = new Date(lastDay); timeMax.setDate(timeMax.getDate() + 1);
+        logger.info(`parseDatePreference: "última semana" de mes ${matchedMonth + 1}/${matchedYear} → ${timeMin.toDateString()} a ${timeMax.toDateString()}`);
+      } else if (isFirstWeek) {
+        timeMin = new Date(firstDay);
+        timeMax = new Date(firstDay); timeMax.setDate(timeMax.getDate() + 7);
+      } else if (isMidMonth) {
+        // Días 11 al 20
+        timeMin = new Date(matchedYear, matchedMonth, 11);
+        timeMax = new Date(matchedYear, matchedMonth, 21);
+      } else if (isEndOfMonth) {
+        // Últimos 10 días del mes
+        timeMin = new Date(lastDay); timeMin.setDate(timeMin.getDate() - 9);
+        timeMax = new Date(lastDay); timeMax.setDate(timeMax.getDate() + 1);
+      } else {
+        // Nombre de mes genérico: buscar en todo el mes restante
+        const isCurrentMonth = matchedMonth === today.getMonth() && matchedYear === today.getFullYear();
+        timeMin = isCurrentMonth ? new Date(today) : new Date(firstDay);
+        timeMax = new Date(lastDay); timeMax.setDate(timeMax.getDate() + 1);
+      }
     } else {
       // Fallback: próximos 5 días
       timeMin = new Date(today);
       timeMax = new Date(today); timeMax.setDate(timeMax.getDate() + 5);
     }
+  }
+
+  // Seguridad: nunca buscar en el pasado
+  if (timeMin < today) {
+    logger.warn(`parseDatePreference: timeMin (${timeMin.toDateString()}) era anterior a hoy — ajustado a hoy`);
+    timeMin = new Date(today);
   }
 
   return { timeMin, timeMax };

@@ -61,7 +61,7 @@ Siempre respondé con JSON puro válido, sin markdown, sin texto extra. Estructu
 
 ACCIONES DISPONIBLES (campo "action"):
 - null: solo responder, sin acción adicional
-- "fetch_slots": consultar Google Calendar. action_params: { "date_preference": "mañana|esta semana|próxima semana|el mes que viene|YYYY-MM-DD|YYYY-MM|nombre del mes" }. Si el paciente pide un mes específico, pasá el nombre exacto del mes (ej: "julio", "agosto", "septiembre 2026"). El sistema buscará la primera semana disponible de ese mes.
+- "fetch_slots": consultar Google Calendar. action_params: { "date_preference": "..." }. Valores posibles: "mañana", "esta semana", "próxima semana", "el mes que viene", YYYY-MM-DD, YYYY-MM, nombre de mes (ej: "julio", "agosto 2026"), o expresiones como "última semana de junio", "primera semana de julio", "fines de agosto", "mediados de septiembre". Pasá la expresión del paciente lo más fielmente posible — el sistema la interpreta.
 - "create_appointment": crear turno. action_params: { "datetime": "ISO8601", "reason": "motivo de consulta" }
 - "cancel_appointment": cancelar turno. action_params: { "appointment_id": "uuid" }
 - "reschedule_appointment": reprogramar. Usá esta acción cuando el paciente quiera cambiar un turno. NO listés los turnos en el texto — el sistema muestra una lista interactiva automáticamente. action_params: {}

@@ -168,11 +168,13 @@ async function processMessage(phone, text, messageId) {
     // 7. Ejecutar acción si corresponde
     let updatedContext = { ...context };
     let finalResponse = response;
+    let stateAlreadySaved = false; // true si la propia acción llamó a setState
 
     if (action) {
       try {
         const result = await executeAction(action, action_params, phone, context, response);
         finalResponse = result.response;
+        stateAlreadySaved = result.stateAlreadySaved === true;
         if (result.slots) updatedContext.slots = result.slots;
         if (result.dayGroups) updatedContext.day_groups = result.dayGroups;
         if (result.slot_mode) updatedContext.slot_mode = result.slot_mode;
@@ -221,10 +223,14 @@ async function processMessage(phone, text, messageId) {
     }
 
     // 9. Guardar nuevo estado
-    // Si finalResponse es null, la acción ya guardó su propio estado (lista interactiva enviada)
-    // No pisarlo con el next_state de Claude
-    const newState = next_state || state;
-    if (finalResponse !== null) {
+    // fetch_slots envía una lista interactiva y retorna response: null.
+    // En ese caso forzamos el estado a selecting_slot para que el siguiente mensaje
+    // del paciente entre al handler de slots (no vuelva a Claude).
+    const newState = (action === 'fetch_slots' && finalResponse === null)
+      ? 'selecting_slot'
+      : (next_state || state);
+
+    if (!stateAlreadySaved) {
       if (newState === 'completed' || (newState === 'idle' && state !== 'idle')) {
         updatedContext.history = [];
       }
@@ -532,7 +538,7 @@ async function executeAction(action, params, phone, context, defaultResponse) {
       }
       await setState(phone, 'selecting_reschedule_target', { ...context });
       await sendAppointmentListForReschedule(phone, appointments, context.patient_name);
-      return { response: null }; // ya enviamos la lista interactiva
+      return { response: null, stateAlreadySaved: true }; // ya guardamos el estado y enviamos la lista
     }
 
     case 'notify_doctor': {
